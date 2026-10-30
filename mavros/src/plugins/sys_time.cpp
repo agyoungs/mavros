@@ -14,6 +14,9 @@
  * https://github.com/mavlink/mavros/tree/master/LICENSE.md
  */
 
+#include <algorithm>
+#include <deque>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -344,6 +347,13 @@ private:
   int high_rtt_count;
   int high_deviation_count;
 
+  // ts1 of our TIMESYNC requests still awaiting a reply, oldest first. A reply
+  // counts only if it echoes one: other components' requests and their replies
+  // reach us too, and their ts1 comes from another clock.
+  std::deque<uint64_t> pending_ts1;
+  std::mutex pending_mutex;
+  static constexpr size_t MAX_PENDING_REQUESTS = 64;
+
   void handle_system_time(
     const mavlink::mavlink_message_t * msg [[maybe_unused]],
     mavlink::common::msg::SYSTEM_TIME & mtime, plugin::filter::SystemAndOk filter [[maybe_unused]])
@@ -369,15 +379,25 @@ private:
   }
 
   void handle_timesync(
-    const mavlink::mavlink_message_t * msg [[maybe_unused]],
-    mavlink::common::msg::TIMESYNC & tsync, plugin::filter::SystemAndOk filter [[maybe_unused]])
+    const mavlink::mavlink_message_t * msg,
+    mavlink::common::msg::TIMESYNC & tsync,
+    plugin::filter::AddressedToUsAndOk filter [[maybe_unused]])
   {
+    // The filter drops requests and replies addressed to another component
+    // (untargeted ones, e.g. from autopilots without the target fields, pass).
     uint64_t now_ns = node->now().nanoseconds();
 
     if (tsync.tc1 == 0) {
-      send_timesync_msg(now_ns, tsync.ts1);
+      // A request: reply to the requester, so routers do not deliver the
+      // reply to everyone.
+      send_timesync_msg(now_ns, tsync.ts1, msg->sysid, msg->compid);
       return;
     } else if (tsync.tc1 > 0) {
+      // A reply: use it only if it comes from the FCU and answers one of our
+      // requests.
+      if (msg->compid != uas->get_tgt_component() || !take_pending_request(tsync.ts1)) {
+        return;
+      }
       // Time offset between this system and the remote system is calculated assuming RTT for
       // the timesync packet is roughly equal both ways. Signed arithmetic: the offset is negative
       // when the remote clock is ahead (e.g. PX4 SITL in lockstep with ROS sim time).
@@ -404,7 +424,9 @@ private:
     if (ts_mode == TSM::NONE || ts_mode == TSM::PASSTHROUGH) {
       // NOTE(vooon): nothing to do. keep timer running for possible mode change
     } else if (ts_mode == TSM::MAVLINK) {
-      send_timesync_msg(0, node->now().nanoseconds());
+      send_timesync_msg(
+        0, add_pending_request(node->now().nanoseconds()),
+        uas->get_tgt_system(), uas->get_tgt_component());
     } else if (ts_mode == TSM::ONBOARD) {
       // Calculate offset between CLOCK_REALTIME (ros::WallTime) and CLOCK_MONOTONIC
       uint64_t realtime_now_ns = node->now().nanoseconds();
@@ -416,13 +438,43 @@ private:
     }
   }
 
-  void send_timesync_msg(uint64_t tc1, uint64_t ts1)
+  void send_timesync_msg(
+    uint64_t tc1, uint64_t ts1, uint8_t target_system,
+    uint8_t target_component)
   {
     mavlink::common::msg::TIMESYNC tsync {};
     tsync.tc1 = tc1;
     tsync.ts1 = ts1;
+    tsync.target_system = target_system;
+    tsync.target_component = target_component;
 
     uas->send_message(tsync);
+  }
+
+  //! Record a request's ts1 (kept unique, as it identifies the reply).
+  uint64_t add_pending_request(uint64_t ts1)
+  {
+    std::lock_guard<std::mutex> lock(pending_mutex);
+    if (!pending_ts1.empty() && ts1 <= pending_ts1.back()) {
+      ts1 = pending_ts1.back() + 1;
+    }
+    pending_ts1.push_back(ts1);
+    while (pending_ts1.size() > MAX_PENDING_REQUESTS) {
+      pending_ts1.pop_front();
+    }
+    return ts1;
+  }
+
+  //! True if ts1 is one of our pending requests, which it then removes.
+  bool take_pending_request(uint64_t ts1)
+  {
+    std::lock_guard<std::mutex> lock(pending_mutex);
+    auto it = std::find(pending_ts1.begin(), pending_ts1.end(), ts1);
+    if (it == pending_ts1.end()) {
+      return false;
+    }
+    pending_ts1.erase(it);
+    return true;
   }
 
   void add_timesync_observation(int64_t offset_ns, uint64_t local_time_ns, uint64_t remote_time_ns)

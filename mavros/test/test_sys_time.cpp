@@ -1,0 +1,197 @@
+//
+// mavros
+// Copyright 2026 Vladimir Ermakov, All rights reserved.
+//
+// This file is part of the mavros package and subject to the license terms
+// in the top-level LICENSE file of the mavros repository.
+// https://github.com/mavlink/mavros/tree/master/LICENSE.md
+//
+
+/**
+ * Tests for sys_time TIMESYNC: requests and replies are addressed, and only the
+ * FCU's replies to our own requests feed the offset estimate.
+ */
+
+#include <memory>
+#include <mutex>
+#include <vector>
+
+#include "test_plugin_helpers.hpp"
+#include "../src/plugins/sys_time.cpp"  // NOLINT(build/include)
+
+using mavros::uas::TestUAS;
+using mavros::uas::UAS;
+using mavlink::common::msg::TIMESYNC;
+
+class SysTimeTest : public TestUAS
+{
+public:
+  static constexpr uint8_t FCU_SYSTEM = 1;
+  static constexpr uint8_t FCU_COMPONENT = 1;
+  // Another component of the FCU's system, e.g. a camera or companion app.
+  static constexpr uint8_t OTHER_COMPONENT = 154;
+
+  UAS::SharedPtr uas;
+  std::shared_ptr<mavros::std_plugins::SystemTimePlugin> plugin;
+  std::shared_ptr<std::vector<mavros_msgs::msg::Mavlink>> out;
+  rclcpp::Node::SharedPtr client;
+  rclcpp::Subscription<mavros_msgs::msg::TimesyncStatus>::SharedPtr status_sub;
+  std::mutex status_mutex;
+  std::vector<mavros_msgs::msg::TimesyncStatus> statuses;
+
+  void SetUp() override
+  {
+    uas = create_uas();
+    uas->set_tgt(FCU_SYSTEM, FCU_COMPONENT);
+
+    plugin = std::make_shared<mavros::std_plugins::SystemTimePlugin>(uas.get());
+    register_plugin(uas, plugin);
+
+    add_node(uas);
+    add_node(plugin->get_node());
+    client = make_client_node("sys_time_client");
+    status_sub = client->create_subscription<mavros_msgs::msg::TimesyncStatus>(
+      "/test_mavros_uas/timesync_status", rclcpp::SensorDataQoS(),
+      [this](const mavros_msgs::msg::TimesyncStatus::SharedPtr m) {
+        std::lock_guard<std::mutex> lock(status_mutex);
+        statuses.push_back(*m);
+      });
+    out = capture_sink(uas);
+    start_spin();
+  }
+
+  void TearDown() override
+  {
+    stop_spin();
+  }
+
+  void inject(const TIMESYNC & m, uint8_t sysid, uint8_t compid)
+  {
+    auto mmsg = convert_message(m);
+    mmsg.sysid = sysid;
+    mmsg.compid = compid;
+    mmsg.msgid = TIMESYNC::MSG_ID;
+    route(uas, &mmsg, mavconn::Framing::ok);
+    std::this_thread::sleep_for(50ms);
+  }
+
+  static TIMESYNC timesync(int64_t tc1, int64_t ts1, uint8_t tgt_sys = 0, uint8_t tgt_comp = 0)
+  {
+    TIMESYNC m{};
+    m.tc1 = tc1;
+    m.ts1 = ts1;
+    m.target_system = tgt_sys;
+    m.target_component = tgt_comp;
+    return m;
+  }
+
+  static TIMESYNC decode(const mavros_msgs::msg::Mavlink & rmsg)
+  {
+    auto m = TestUAS::to_mavlink(rmsg);
+    TIMESYNC out{};
+    mavlink::MsgMap map(m);
+    out.deserialize(map);
+    return out;
+  }
+
+  std::vector<TIMESYNC> sent()
+  {
+    std::vector<TIMESYNC> ret;
+    for (const auto & m : *out) {
+      if (m.msgid == TIMESYNC::MSG_ID) {
+        ret.push_back(decode(m));
+      }
+    }
+    return ret;
+  }
+
+  size_t status_count()
+  {
+    std::lock_guard<std::mutex> lock(status_mutex);
+    return statuses.size();
+  }
+
+  //! Start requesting and return the first request sent.
+  TIMESYNC first_request()
+  {
+    plugin->get_node()->set_parameter(rclcpp::Parameter("timesync_rate", 20.0));
+    auto rmsg = wait_msgid(*out, TIMESYNC::MSG_ID);
+    EXPECT_EQ(rmsg.msgid, TIMESYNC::MSG_ID);
+    return decode(rmsg);
+  }
+};
+
+TEST_F(SysTimeTest, requests_are_addressed_to_the_fcu)
+{
+  auto request = first_request();
+  EXPECT_EQ(request.tc1, 0);
+  EXPECT_GT(request.ts1, 0);
+  EXPECT_EQ(request.target_system, FCU_SYSTEM);
+  EXPECT_EQ(request.target_component, FCU_COMPONENT);
+}
+
+TEST_F(SysTimeTest, replies_are_addressed_to_the_requester)
+{
+  inject(timesync(0, 1234), FCU_SYSTEM, OTHER_COMPONENT);
+
+  auto replies = sent();
+  ASSERT_EQ(replies.size(), 1u);
+  EXPECT_GT(replies[0].tc1, 0);
+  EXPECT_EQ(replies[0].ts1, 1234);
+  EXPECT_EQ(replies[0].target_system, FCU_SYSTEM);
+  EXPECT_EQ(replies[0].target_component, OTHER_COMPONENT);
+}
+
+TEST_F(SysTimeTest, requests_for_another_component_are_not_answered)
+{
+  inject(timesync(0, 1234, FCU_SYSTEM, OTHER_COMPONENT), FCU_SYSTEM, FCU_COMPONENT);
+  EXPECT_TRUE(sent().empty());
+}
+
+TEST_F(SysTimeTest, only_the_fcus_reply_to_our_request_is_used)
+{
+  auto request = first_request();
+  const int64_t fcu_time_ns = 5'000'000'000;
+
+  // A reply to someone else's request (another ts1), and our ts1 echoed by
+  // another component: neither is ours.
+  inject(timesync(fcu_time_ns, request.ts1 + 7), FCU_SYSTEM, FCU_COMPONENT);
+  inject(timesync(fcu_time_ns, request.ts1), FCU_SYSTEM, OTHER_COMPONENT);
+  EXPECT_EQ(status_count(), 0u);
+
+  // The FCU's reply, without target fields as ArduPilot sends it.
+  inject(timesync(fcu_time_ns, request.ts1), FCU_SYSTEM, FCU_COMPONENT);
+  const auto deadline = std::chrono::steady_clock::now() + 2s;
+  while (status_count() == 0 && std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(10ms);
+  }
+  ASSERT_EQ(status_count(), 1u);
+  {
+    std::lock_guard<std::mutex> lock(status_mutex);
+    EXPECT_EQ(statuses[0].remote_timestamp_ns, static_cast<uint64_t>(fcu_time_ns));
+  }
+
+  // The same reply again (e.g. a router duplicate) answers nothing pending.
+  inject(timesync(fcu_time_ns, request.ts1), FCU_SYSTEM, FCU_COMPONENT);
+  std::this_thread::sleep_for(100ms);
+  EXPECT_EQ(status_count(), 1u);
+}
+
+TEST_F(SysTimeTest, replies_addressed_to_another_component_are_ignored)
+{
+  auto request = first_request();
+  inject(
+    timesync(5'000'000'000, request.ts1, FCU_SYSTEM, OTHER_COMPONENT),
+    FCU_SYSTEM, FCU_COMPONENT);
+  std::this_thread::sleep_for(100ms);
+  EXPECT_EQ(status_count(), 0u);
+}
+
+int main(int argc, char ** argv)
+{
+  ::testing::InitGoogleTest(&argc, argv);
+  TestUAS::Init();
+  int rc = RUN_ALL_TESTS();
+  rclcpp::shutdown();
+  return rc;
+}
