@@ -72,7 +72,6 @@ public:
     mmsg.sysid = sysid;
     mmsg.compid = compid;
     route(uas, &mmsg, mavconn::Framing::ok);
-    std::this_thread::sleep_for(50ms);
   }
 
   static TIMESYNC timesync(int64_t tc1, int64_t ts1, uint8_t tgt_sys = 0, uint8_t tgt_comp = 0)
@@ -109,6 +108,59 @@ public:
   {
     std::lock_guard<std::mutex> lock(status_mutex);
     return statuses.size();
+  }
+
+  // The plugin handles an injected message before inject() returns, and its
+  // replies and statuses arrive in that order. So the tests check that a message
+  // was ignored by sending a valid one after it: once the valid one's result
+  // arrives, a result from the ignored one would already be there before it.
+
+  //! Wait for n TIMESYNC replies (tc1 > 0) sent by the plugin; return those sent.
+  std::vector<TIMESYNC> wait_replies(size_t n)
+  {
+    std::vector<TIMESYNC> replies;
+    const auto deadline = std::chrono::steady_clock::now() + 2s;
+    do {
+      replies.clear();
+      for (const auto & m : sent()) {
+        if (m.tc1 > 0) {
+          replies.push_back(m);
+        }
+      }
+      if (replies.size() >= n) {
+        break;
+      }
+      std::this_thread::sleep_for(10ms);
+    } while (std::chrono::steady_clock::now() < deadline);
+    return replies;
+  }
+
+  //! Wait for n timesync statuses; return the remote timestamp of each published.
+  std::vector<uint64_t> wait_status_stamps(size_t n)
+  {
+    wait_status_count(n);
+    std::lock_guard<std::mutex> lock(status_mutex);
+    std::vector<uint64_t> stamps;
+    for (const auto & st : statuses) {
+      stamps.push_back(st.remote_timestamp_ns);
+    }
+    return stamps;
+  }
+
+  //! Wait for a request sent after the one with the given ts1.
+  TIMESYNC wait_request_after(int64_t ts1)
+  {
+    const auto deadline = std::chrono::steady_clock::now() + 2s;
+    while (std::chrono::steady_clock::now() < deadline) {
+      for (const auto & m : sent()) {
+        if (m.tc1 == 0 && m.ts1 > ts1) {
+          return m;
+        }
+      }
+      std::this_thread::sleep_for(10ms);
+    }
+    ADD_FAILURE() << "no request after ts1 " << ts1;
+    return TIMESYNC{};
   }
 
   //! Start requesting and return the first request sent.
@@ -172,7 +224,7 @@ TEST_F(SysTimeTest, replies_are_addressed_to_the_requester)
 {
   inject(timesync(0, 1234), FCU_SYSTEM, OTHER_COMPONENT);
 
-  auto replies = sent();
+  auto replies = wait_replies(1);
   ASSERT_EQ(replies.size(), 1u);
   EXPECT_GT(replies[0].tc1, 0);
   EXPECT_EQ(replies[0].ts1, 1234);
@@ -183,43 +235,52 @@ TEST_F(SysTimeTest, replies_are_addressed_to_the_requester)
 TEST_F(SysTimeTest, requests_for_another_component_are_not_answered)
 {
   inject(timesync(0, 1234, FCU_SYSTEM, OTHER_COMPONENT), FCU_SYSTEM, FCU_COMPONENT);
-  EXPECT_TRUE(sent().empty());
+  // A broadcast request is answered; it is the only reply.
+  inject(timesync(0, 5678), FCU_SYSTEM, FCU_COMPONENT);
+
+  auto replies = wait_replies(1);
+  ASSERT_EQ(replies.size(), 1u);
+  EXPECT_EQ(replies[0].ts1, 5678);
 }
 
 TEST_F(SysTimeTest, only_the_fcus_reply_to_our_request_is_used)
 {
   auto request = first_request();
-  const int64_t fcu_time_ns = 5'000'000'000;
 
   // A reply to someone else's request (another ts1), and our ts1 echoed by
   // another component: neither is ours.
-  inject(timesync(fcu_time_ns, request.ts1 + 7), FCU_SYSTEM, FCU_COMPONENT);
-  inject(timesync(fcu_time_ns, request.ts1), FCU_SYSTEM, OTHER_COMPONENT);
-  EXPECT_EQ(status_count(), 0u);
-
+  inject(timesync(1'000'000'000, request.ts1 + 7), FCU_SYSTEM, FCU_COMPONENT);
+  inject(timesync(2'000'000'000, request.ts1), FCU_SYSTEM, OTHER_COMPONENT);
   // The FCU's reply, without target fields as ArduPilot sends it.
-  inject(timesync(fcu_time_ns, request.ts1), FCU_SYSTEM, FCU_COMPONENT);
-  wait_status_count(1);
-  ASSERT_EQ(status_count(), 1u);
-  {
-    std::lock_guard<std::mutex> lock(status_mutex);
-    EXPECT_EQ(statuses[0].remote_timestamp_ns, static_cast<uint64_t>(fcu_time_ns));
-  }
+  inject(timesync(5'000'000'000, request.ts1), FCU_SYSTEM, FCU_COMPONENT);
 
-  // The same reply again (e.g. a router duplicate) answers nothing pending.
-  inject(timesync(fcu_time_ns, request.ts1), FCU_SYSTEM, FCU_COMPONENT);
-  std::this_thread::sleep_for(100ms);
-  EXPECT_EQ(status_count(), 1u);
+  auto stamps = wait_status_stamps(1);
+  ASSERT_EQ(stamps.size(), 1u);
+  EXPECT_EQ(stamps[0], 5'000'000'000u);
+
+  // The same reply again (e.g. a router duplicate) answers nothing pending; the
+  // FCU's reply to a later request does.
+  inject(timesync(5'000'000'000, request.ts1), FCU_SYSTEM, FCU_COMPONENT);
+  auto later = wait_request_after(request.ts1);
+  inject(timesync(7'000'000'000, later.ts1), FCU_SYSTEM, FCU_COMPONENT);
+
+  stamps = wait_status_stamps(2);
+  ASSERT_EQ(stamps.size(), 2u);
+  EXPECT_EQ(stamps[1], 7'000'000'000u);
 }
 
 TEST_F(SysTimeTest, replies_addressed_to_another_component_are_ignored)
 {
   auto request = first_request();
   inject(
-    timesync(5'000'000'000, request.ts1, FCU_SYSTEM, OTHER_COMPONENT),
+    timesync(1'000'000'000, request.ts1, FCU_SYSTEM, OTHER_COMPONENT),
     FCU_SYSTEM, FCU_COMPONENT);
-  std::this_thread::sleep_for(100ms);
-  EXPECT_EQ(status_count(), 0u);
+  // Had the first been used, it would have taken the pending request.
+  inject(timesync(5'000'000'000, request.ts1), FCU_SYSTEM, FCU_COMPONENT);
+
+  auto stamps = wait_status_stamps(1);
+  ASSERT_EQ(stamps.size(), 1u);
+  EXPECT_EQ(stamps[0], 5'000'000'000u);
 }
 
 TEST_F(SysTimeTest, target_component_zero_accepts_any_component)
@@ -227,8 +288,7 @@ TEST_F(SysTimeTest, target_component_zero_accepts_any_component)
   uas->set_tgt(FCU_SYSTEM, 0);
   auto request = first_request();
   inject(timesync(5'000'000'000, request.ts1), FCU_SYSTEM, FCU_COMPONENT);
-  wait_status_count(1);
-  EXPECT_EQ(status_count(), 1u);
+  EXPECT_EQ(wait_status_stamps(1), std::vector<uint64_t>{5'000'000'000u});
 }
 
 TEST_F(SysTimeTest, sync_resumes_after_the_clock_steps_back)
@@ -244,8 +304,7 @@ TEST_F(SysTimeTest, sync_resumes_after_the_clock_steps_back)
   ASSERT_TRUE(wait_request_below(100'000'000'000));
   const int64_t ts1 = 50'000'000'000;
   inject(timesync(5'000'000'000, ts1), FCU_SYSTEM, FCU_COMPONENT);
-  wait_status_count(1);
-  EXPECT_EQ(status_count(), 1u);
+  EXPECT_EQ(wait_status_stamps(1), std::vector<uint64_t>{5'000'000'000u});
 }
 
 int main(int argc, char ** argv)
