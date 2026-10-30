@@ -16,6 +16,7 @@
 #include <mutex>
 #include <vector>
 
+#include "rosgraph_msgs/msg/clock.hpp"
 #include "test_plugin_helpers.hpp"
 #include "../src/plugins/sys_time.cpp"  // NOLINT(build/include)
 
@@ -33,7 +34,7 @@ public:
 
   UAS::SharedPtr uas;
   std::shared_ptr<mavros::std_plugins::SystemTimePlugin> plugin;
-  std::shared_ptr<std::vector<mavros_msgs::msg::Mavlink>> out;
+  std::shared_ptr<CaptureBuffer> out;
   rclcpp::Node::SharedPtr client;
   rclcpp::Subscription<mavros_msgs::msg::TimesyncStatus>::SharedPtr status_sub;
   std::mutex status_mutex;
@@ -70,7 +71,6 @@ public:
     auto mmsg = convert_message(m);
     mmsg.sysid = sysid;
     mmsg.compid = compid;
-    mmsg.msgid = TIMESYNC::MSG_ID;
     route(uas, &mmsg, mavconn::Framing::ok);
     std::this_thread::sleep_for(50ms);
   }
@@ -97,7 +97,7 @@ public:
   std::vector<TIMESYNC> sent()
   {
     std::vector<TIMESYNC> ret;
-    for (const auto & m : *out) {
+    for (const auto & m : out->snapshot()) {
       if (m.msgid == TIMESYNC::MSG_ID) {
         ret.push_back(decode(m));
       }
@@ -118,6 +118,44 @@ public:
     auto rmsg = wait_msgid(*out, TIMESYNC::MSG_ID);
     EXPECT_EQ(rmsg.msgid, TIMESYNC::MSG_ID);
     return decode(rmsg);
+  }
+
+  //! Publish sim time until the plugin's clock reads it.
+  void set_sim_time(const rclcpp::Publisher<rosgraph_msgs::msg::Clock>::SharedPtr & pub, int sec)
+  {
+    rosgraph_msgs::msg::Clock clock;
+    clock.clock.sec = sec;
+    const auto deadline = std::chrono::steady_clock::now() + 2s;
+    while (plugin->get_node()->now().seconds() != sec &&
+      std::chrono::steady_clock::now() < deadline)
+    {
+      pub->publish(clock);
+      std::this_thread::sleep_for(10ms);
+    }
+    ASSERT_EQ(plugin->get_node()->now().seconds(), sec);
+  }
+
+  //! Wait for a request whose ts1 is below the given value.
+  bool wait_request_below(int64_t ts1)
+  {
+    const auto deadline = std::chrono::steady_clock::now() + 2s;
+    while (std::chrono::steady_clock::now() < deadline) {
+      for (const auto & m : sent()) {
+        if (m.tc1 == 0 && m.ts1 < ts1) {
+          return true;
+        }
+      }
+      std::this_thread::sleep_for(10ms);
+    }
+    return false;
+  }
+
+  void wait_status_count(size_t n)
+  {
+    const auto deadline = std::chrono::steady_clock::now() + 2s;
+    while (status_count() < n && std::chrono::steady_clock::now() < deadline) {
+      std::this_thread::sleep_for(10ms);
+    }
   }
 };
 
@@ -161,10 +199,7 @@ TEST_F(SysTimeTest, only_the_fcus_reply_to_our_request_is_used)
 
   // The FCU's reply, without target fields as ArduPilot sends it.
   inject(timesync(fcu_time_ns, request.ts1), FCU_SYSTEM, FCU_COMPONENT);
-  const auto deadline = std::chrono::steady_clock::now() + 2s;
-  while (status_count() == 0 && std::chrono::steady_clock::now() < deadline) {
-    std::this_thread::sleep_for(10ms);
-  }
+  wait_status_count(1);
   ASSERT_EQ(status_count(), 1u);
   {
     std::lock_guard<std::mutex> lock(status_mutex);
@@ -185,6 +220,32 @@ TEST_F(SysTimeTest, replies_addressed_to_another_component_are_ignored)
     FCU_SYSTEM, FCU_COMPONENT);
   std::this_thread::sleep_for(100ms);
   EXPECT_EQ(status_count(), 0u);
+}
+
+TEST_F(SysTimeTest, target_component_zero_accepts_any_component)
+{
+  uas->set_tgt(FCU_SYSTEM, 0);
+  auto request = first_request();
+  inject(timesync(5'000'000'000, request.ts1), FCU_SYSTEM, FCU_COMPONENT);
+  wait_status_count(1);
+  EXPECT_EQ(status_count(), 1u);
+}
+
+TEST_F(SysTimeTest, sync_resumes_after_the_clock_steps_back)
+{
+  // With sim time a SITL restart steps our clock back; an NTP step can too.
+  auto clock_pub = client->create_publisher<rosgraph_msgs::msg::Clock>(
+    "/clock", rclcpp::ClockQoS());
+  plugin->get_node()->set_parameter(rclcpp::Parameter("use_sim_time", true));
+  set_sim_time(clock_pub, 100);
+  first_request();
+
+  set_sim_time(clock_pub, 50);
+  ASSERT_TRUE(wait_request_below(100'000'000'000));
+  const int64_t ts1 = 50'000'000'000;
+  inject(timesync(5'000'000'000, ts1), FCU_SYSTEM, FCU_COMPONENT);
+  wait_status_count(1);
+  EXPECT_EQ(status_count(), 1u);
 }
 
 int main(int argc, char ** argv)

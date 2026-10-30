@@ -394,8 +394,20 @@ private:
       return;
     } else if (tsync.tc1 > 0) {
       // A reply: use it only if it comes from the FCU and answers one of our
-      // requests.
-      if (msg->compid != uas->get_tgt_component() || !take_pending_request(tsync.ts1)) {
+      // requests. The filter has already checked the system id; target
+      // component 0 accepts any component.
+      const uint8_t tgt_component = uas->get_tgt_component();
+      if (tgt_component != 0 && msg->compid != tgt_component) {
+        if (is_pending_request(tsync.ts1)) {
+          RCLCPP_WARN_THROTTLE(
+            get_logger(), *get_clock(), 10000,
+            "TM: Reply to our TIMESYNC request from component %d, not the target %d; ignored.",
+            msg->compid, tgt_component);
+        }
+        return;
+      }
+      if (!take_pending_request(tsync.ts1)) {
+        RCLCPP_DEBUG(get_logger(), "TM: TIMESYNC reply to another request; ignored.");
         return;
       }
       // Time offset between this system and the remote system is calculated assuming RTT for
@@ -424,9 +436,9 @@ private:
     if (ts_mode == TSM::NONE || ts_mode == TSM::PASSTHROUGH) {
       // NOTE(vooon): nothing to do. keep timer running for possible mode change
     } else if (ts_mode == TSM::MAVLINK) {
-      send_timesync_msg(
-        0, add_pending_request(node->now().nanoseconds()),
-        uas->get_tgt_system(), uas->get_tgt_component());
+      const uint64_t now_ns = node->now().nanoseconds();
+      add_pending_request(now_ns);
+      send_timesync_msg(0, now_ns, uas->get_tgt_system(), uas->get_tgt_component());
     } else if (ts_mode == TSM::ONBOARD) {
       // Calculate offset between CLOCK_REALTIME (ros::WallTime) and CLOCK_MONOTONIC
       uint64_t realtime_now_ns = node->now().nanoseconds();
@@ -451,18 +463,21 @@ private:
     uas->send_message(tsync);
   }
 
-  //! Record a request's ts1 (kept unique, as it identifies the reply).
-  uint64_t add_pending_request(uint64_t ts1)
+  //! Record a request's ts1. Duplicates are harmless: each reply takes one.
+  void add_pending_request(uint64_t ts1)
   {
     std::lock_guard<std::mutex> lock(pending_mutex);
-    if (!pending_ts1.empty() && ts1 <= pending_ts1.back()) {
-      ts1 = pending_ts1.back() + 1;
-    }
     pending_ts1.push_back(ts1);
     while (pending_ts1.size() > MAX_PENDING_REQUESTS) {
       pending_ts1.pop_front();
     }
-    return ts1;
+  }
+
+  //! True if ts1 is one of our pending requests.
+  bool is_pending_request(uint64_t ts1)
+  {
+    std::lock_guard<std::mutex> lock(pending_mutex);
+    return std::find(pending_ts1.begin(), pending_ts1.end(), ts1) != pending_ts1.end();
   }
 
   //! True if ts1 is one of our pending requests, which it then removes.

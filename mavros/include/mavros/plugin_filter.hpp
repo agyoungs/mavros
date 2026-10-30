@@ -78,7 +78,9 @@ public:
 };
 
 //! AddressedToUsAndOk filter passes what SystemAndOk passes, if the message's
-//  target system/component ids (when it has them) are ours or broadcast (0)
+//  target system/component ids (when it has them) are ours or broadcast (0).
+//  It only knows the messages of the common dialect: any other message,
+//  e.g. one only in ardupilotmega, is always dropped.
 class AddressedToUsAndOk : public SystemAndOk
 {
 public:
